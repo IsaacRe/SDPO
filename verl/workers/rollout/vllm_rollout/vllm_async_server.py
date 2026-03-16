@@ -41,8 +41,12 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
+
+try:
+    from vllm.v1.engine.utils import CoreEngineProcManager
+except ImportError:
+    CoreEngineProcManager = None
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
@@ -75,7 +79,13 @@ if _VLLM_VERSION > version.parse("0.11.0"):
 
         get_encoding()
 else:
-    from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+    from vllm.utils import FlexibleArgumentParser
+
+    def get_tcp_uri(host: str, port: int) -> str:
+        host = host.strip("[]")
+        if is_valid_ipv6_address(host):
+            host = f"[{host}]"
+        return f"tcp://{host}:{port}"
 if _VLLM_VERSION >= version.parse("0.12.0"):
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
@@ -417,14 +427,16 @@ class vLLMHttpServer:
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
-        # Don't keep the dummy data in memory
-        await engine_client.reset_mm_cache()
+        # Don't keep the dummy data in memory when supported by the current vLLM version.
+        if hasattr(engine_client, "reset_mm_cache"):
+            await engine_client.reset_mm_cache()
 
         app = build_app(args)
         if _VLLM_VERSION > version.parse("0.11.0"):
             await init_app_state(engine_client, app.state, args)
         else:
-            await init_app_state(engine_client, vllm_config, app.state, args)
+            model_config = getattr(vllm_config, "model_config", vllm_config)
+            await init_app_state(engine_client, model_config, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
@@ -432,6 +444,12 @@ class vLLMHttpServer:
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
+        if CoreEngineProcManager is None:
+            raise ImportError(
+                "CoreEngineProcManager is unavailable in this vLLM build. "
+                "Please upgrade vLLM for multi-node headless server mode."
+            )
+
         # Create the EngineConfig.
         engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
@@ -501,8 +519,10 @@ class vLLMHttpServer:
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
-
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        if multi_modal_data:
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        else:
+            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
 
         # Add lora request
         lora_request = None
@@ -578,7 +598,8 @@ class vLLMHttpServer:
             await self.engine.reset_prefix_cache()
 
     async def wait_for_requests_to_drain(self):
-        await self.engine.wait_for_requests_to_drain()
+        if hasattr(self.engine, "wait_for_requests_to_drain"):
+            await self.engine.wait_for_requests_to_drain()
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.

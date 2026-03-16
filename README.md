@@ -259,6 +259,24 @@ bash experiments/rich_feedback/run_baseline_grpo.sh
 bash experiments/rich_feedback/run_sdpo.sh
 ```
 
+#### Single-H200 Local Comparison (Chemistry)
+
+For a lightweight local comparison on one H200 GPU, run:
+
+```bash
+bash run_local_h200_chem_compare.sh
+```
+
+This script runs matched SDPO and GRPO training jobs on `datasets/sciknoweval/chemistry`
+using `Qwen/Qwen2.5-0.5B-Instruct`, then prints peak `acc/mean@4` and `acc/best@4/mean`
+for both runs.
+
+You can override defaults via environment variables, for example:
+
+```bash
+STEPS=8 TRAIN_BS=4 ROLLOUT_N=2 VAL_N=4 LOG_DIR=/tmp bash run_local_h200_chem_compare.sh
+```
+
 ---
 
 ### Multi-turn Baseline of Section 5
