@@ -27,7 +27,7 @@ PARTITION="normal"
 TIME="12:00:00"
 ENV="sdpo"
 NTASKS_PER_NODE=1
-GPUS_PER_NODE=4
+GPUS_PER_NODE=1
 MEM=460000
 CPUS_PER_TASK=288
 
@@ -43,7 +43,7 @@ DONTS_REPROMPT_ON_SELF_SUCCESSS=(True)
 ALPHAS=(1.0)
 
 MODEL_PATHS=(
-    "Qwen/Qwen3-8B"
+    "Qwen/Qwen3-4B"
 )
 # =============================================================================
 # JOB SUBMISSION FUNCTION
@@ -59,6 +59,7 @@ submit_job() {
     local setup_cmds="pip install word2number latex2sympy2 math-verify[antlr4_9_3]==0.8.0; \
 pip install -e /users/$USER/SDPO; \
 pip install --upgrade wandb; \
+export WANDB_CONSOLE=off; \
 export PYTHONPATH=/users/$USER/SDPO:\$PYTHONPATH"
 
     local run_cmd="bash /users/$USER/SDPO/training/verl_training.sh $exp_name $CONFIG_NAME $data_path $script_args"
@@ -113,6 +114,8 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
 trainer.group_name=SDPO-rich-feedback \
 actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE \
 actor_rollout_ref.model.path=$MODEL_PATH \
+actor_rollout_ref.model.use_remove_padding=False \
++actor_rollout_ref.model.override_config.attn_implementation=eager \
 actor_rollout_ref.actor.optim.lr=$LR \
 actor_rollout_ref.actor.ppo_mini_batch_size=1 \
 actor_rollout_ref.actor.self_distillation.distillation_topk=20 \
@@ -121,7 +124,12 @@ actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONTS_
 actor_rollout_ref.actor.self_distillation.alpha=$ALPHA \
 actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.01 \
 actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
-actor_rollout_ref.rollout.val_kwargs.n=4"
+actor_rollout_ref.rollout.val_kwargs.n=4 \
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+reward_model.reward_manager=batch \
+trainer.n_gpus_per_node=1 \
+actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+actor_rollout_ref.rollout.gpu_memory_utilization=0.25"
 
                             # 3. Submit
                             submit_job "$EXP_NAME" "$ARGS" "$DATA_PATH"
@@ -132,4 +140,3 @@ actor_rollout_ref.rollout.val_kwargs.n=4"
         done
     done
 done
-

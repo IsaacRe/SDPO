@@ -46,6 +46,7 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+MICROBATCH_PROGRESS_ENABLED = os.getenv("VERL_MICROBATCH_PROGRESS", "0") == "1"
 
 
 class TrustRegionTeacher(nn.Module):
@@ -750,7 +751,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                total_micro_batches = len(micro_batches)
+                for micro_batch_idx, micro_batch in enumerate(micro_batches, start=1):
+                    if MICROBATCH_PROGRESS_ENABLED:
+                        print(
+                            f"[actor] mini_batch {batch_idx + 1}/{len(mini_batches)} "
+                            f"micro_batch {micro_batch_idx}/{total_micro_batches}"
+                        )
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
