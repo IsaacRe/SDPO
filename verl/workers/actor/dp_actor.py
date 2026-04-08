@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Optional
 
@@ -29,7 +30,14 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_layerwise_self_distillation_loss,
+    compute_layerwise_token_weights,
+    compute_self_distillation_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -40,6 +48,7 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.layerwise_distillation import LayerwiseActivationCapture, resolve_layer_pairs
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor"]
@@ -197,7 +206,7 @@ class DataParallelPPOActor(BasePPOActor):
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
         use_topk = distill_topk is not None or topk_indices is not None
-        compute_all_logps = return_all_logps and not use_topk
+        compute_all_logps = return_all_logps
         return_topk_indices = use_topk and topk_indices is None
         if (return_all_logps or use_topk) and self.use_fused_kernels:
             raise ValueError("Logit distillation requires disabling fused kernels.")
@@ -781,95 +790,163 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     if teacher_regularization == "trust-region" and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
-                    # all return: (bsz, response_length)
-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
-                    outputs = self._forward_micro_batch(
-                        model_inputs,
-                        temperature=temperature,
-                        calculate_entropy=calculate_entropy,
-                        return_all_logps=return_all_logps,
-                        distill_topk=distill_topk,
+                    layerwise_enabled = (
+                        self_distillation_enabled
+                        and self_distillation_cfg.get("layerwise_enabled", False)
+                        and self_distillation_cfg.get("layerwise_weight", 0.0) > 0.0
                     )
-                    log_prob = outputs["log_probs"]
-                    entropy = outputs["entropys"] if calculate_entropy else None
-                    student_all_logps = outputs.get("all_logps") if return_all_logps else None
-                    student_topk_logps = outputs.get("topk_logps") if distill_topk else None
-                    student_topk_indices = outputs.get("topk_indices") if distill_topk else None
+                    layer_pairs = (
+                        resolve_layer_pairs(
+                            self.actor_module,
+                            teacher_model,
+                            layer_pairs=self_distillation_cfg.get("layer_pairs", []),
+                            aligned_layers=self_distillation_cfg.get("aligned_layers", {}),
+                        )
+                        if layerwise_enabled
+                        else []
+                    )
+                    layerwise_weight_mode = (
+                        self_distillation_cfg.get("layerwise_token_weighting", "none") if layerwise_enabled else "none"
+                    )
+                    # all return: (bsz, response_length)
+                    return_all_logps = (
+                        (self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk)
+                        or layerwise_weight_mode != "none"
+                    )
+                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                    teacher_model = self.teacher_module or self.actor_module
+                    if teacher_regularization == "trust-region" and (
+                        self.teacher_module is None or self.teacher_module is self.actor_module
+                    ):
+                        raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                    with (
+                        LayerwiseActivationCapture(self.actor_module, teacher_model, layer_pairs)
+                        if layerwise_enabled
+                        else nullcontext()
+                    ) as layerwise_capture:
+                        if layerwise_enabled:
+                            layerwise_capture.set_phase("student")
+                        outputs = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            return_all_logps=return_all_logps,
+                            distill_topk=distill_topk,
+                        )
+                        log_prob = outputs["log_probs"]
+                        entropy = outputs["entropys"] if calculate_entropy else None
+                        student_all_logps = outputs.get("all_logps") if return_all_logps else None
+                        student_topk_logps = outputs.get("topk_logps") if distill_topk else None
+                        student_topk_indices = outputs.get("topk_indices") if distill_topk else None
 
-                    # for fully_async_policy
-                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                        old_log_prob = model_inputs["old_log_probs"]
-                    else:
-                        if on_policy:
-                            old_log_prob = log_prob.detach()
-                        else:
+                        # for fully_async_policy
+                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                             old_log_prob = model_inputs["old_log_probs"]
+                        else:
+                            if on_policy:
+                                old_log_prob = log_prob.detach()
+                            else:
+                                old_log_prob = model_inputs["old_log_probs"]
 
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
-                    # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                        # Extract pre-computed rollout correction weights if present
+                        # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    if self_distillation_enabled:
-                        teacher_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_input_ids"],
-                            "attention_mask": model_inputs["teacher_attention_mask"],
-                            "position_ids": model_inputs["teacher_position_ids"],
-                        }
-                        teacher_model = self.teacher_module or self.actor_module
-                        if teacher_regularization == "trust-region" and (
-                            self.teacher_module is None or self.teacher_module is self.actor_module
-                        ):
-                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
-                        with torch.no_grad():
-                            teacher_outputs = self._forward_micro_batch(
-                                teacher_inputs,
-                                temperature=temperature,
-                                calculate_entropy=False,
-                                return_all_logps=return_all_logps,
-                                distill_topk=distill_topk,
-                                topk_indices=student_topk_indices,
-                                module=teacher_model,
+                        if self_distillation_enabled:
+                            teacher_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids"],
+                                "attention_mask": model_inputs["teacher_attention_mask"],
+                                "position_ids": model_inputs["teacher_position_ids"],
+                            }
+                            if layerwise_enabled:
+                                layerwise_capture.set_phase("teacher")
+                            with torch.no_grad():
+                                teacher_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                            if layerwise_enabled:
+                                layerwise_capture.set_phase(None)
+                            teacher_log_prob = teacher_outputs["log_probs"]
+                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                            logits_kd_loss, pg_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
                             )
-                        teacher_log_prob = teacher_outputs["log_probs"]
-                        teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
-                        teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                        pg_loss, pg_metrics = compute_self_distillation_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
-                            self_distillation_config=self_distillation_cfg,
-                            old_log_probs=old_log_prob,
-                            student_all_log_probs=student_all_logps,
-                            teacher_all_log_probs=teacher_all_logps,
-                            student_topk_log_probs=student_topk_logps,
-                            teacher_topk_log_probs=teacher_topk_logps,
-                            self_distillation_mask=self_distillation_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            rollout_is_weights=rollout_is_weights,
-                        )
 
-                        pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
-                        micro_batch_metrics.update(pg_metrics)
-                    else:
-                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+                            pg_loss = logits_kd_loss
+                            pg_metrics["self_distillation/logits_kd_loss"] = logits_kd_loss.detach().item()
 
-                        # Compute policy loss (any function is expected to return 2 values)
-                        pg_loss, pg_metrics = policy_loss_fn(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            config=self.config,
-                            rollout_is_weights=rollout_is_weights,
-                        )
-                        micro_batch_metrics.update(pg_metrics)
+                            if layerwise_enabled:
+                                layerwise_token_weights, layerwise_weight_metrics = compute_layerwise_token_weights(
+                                    student_all_log_probs=student_all_logps,
+                                    teacher_all_log_probs=teacher_all_logps,
+                                    response_mask=response_mask,
+                                    weight_mode=layerwise_weight_mode,
+                                    self_distillation_mask=self_distillation_mask,
+                                )
+                                student_hidden_states = layerwise_capture.get_student_activations()
+                                raw_teacher_hidden_states = layerwise_capture.get_teacher_activations()
+                                teacher_hidden_states = {
+                                    student_layer: raw_teacher_hidden_states[teacher_layer]
+                                    for student_layer, teacher_layer in layer_pairs
+                                }
+                                layerwise_loss, layerwise_metrics = compute_layerwise_self_distillation_loss(
+                                    student_hidden_states=student_hidden_states,
+                                    teacher_hidden_states=teacher_hidden_states,
+                                    response_mask=response_mask,
+                                    self_distillation_config=self_distillation_cfg,
+                                    self_distillation_mask=self_distillation_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                    token_weights=layerwise_token_weights,
+                                    rollout_is_weights=rollout_is_weights,
+                                )
+                                pg_loss = pg_loss + self_distillation_cfg.layerwise_weight * layerwise_loss
+                                pg_metrics["self_distillation/layerwise_kd_loss"] = layerwise_loss.detach().item()
+                                pg_metrics["self_distillation/layerwise_weight"] = self_distillation_cfg.layerwise_weight
+                                pg_metrics.update(layerwise_weight_metrics)
+                                pg_metrics.update(layerwise_metrics)
+
+                            pg_metrics["self_distillation/total_kd_loss"] = pg_loss.detach().item()
+                            pg_metrics["self_distillation/empty_target_batch"] = (
+                                self_distillation_mask.sum().item() == 0
+                            )
+                            micro_batch_metrics.update(pg_metrics)
+                        else:
+                            # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                            # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                            policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                            # Compute policy loss (any function is expected to return 2 values)
+                            pg_loss, pg_metrics = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                            micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)

@@ -15,12 +15,16 @@
 import os
 import unittest
 
+import torch.nn as nn
+
 from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.actor.layerwise_distillation import resolve_layer_pairs
 from verl.workers.config import (
     ActorConfig,
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    SelfDistillationConfig,
 )
 
 
@@ -213,6 +217,82 @@ class TestActorConfig(unittest.TestCase):
             rollout_n=1,
         )
         self.assertIsNotNone(config)  # Should not raise an exception
+
+    def test_self_distillation_layerwise_validation(self):
+        config = SelfDistillationConfig(
+            layerwise_enabled=True,
+            layer_pairs=["model.layers.0"],
+            layerwise_token_weighting="sqrt_jsd",
+            layer_loss_type="smooth_l1",
+            layerwise_weight=0.25,
+        )
+        self.assertTrue(config.layerwise_enabled)
+        self.assertEqual(config.layer_pairs, ["model.layers.0"])
+        self.assertEqual(config.layerwise_token_weighting, "sqrt_jsd")
+
+        with self.assertRaises(ValueError):
+            SelfDistillationConfig(layerwise_enabled=True, layer_pairs=[])
+
+        aligned_config = SelfDistillationConfig(
+            layerwise_enabled=True,
+            aligned_layers={"layer_list": "model.layers", "output_module": "self_attn"},
+        )
+        self.assertEqual(aligned_config.aligned_layers["layer_list"], "model.layers")
+
+        with self.assertRaises(ValueError):
+            SelfDistillationConfig(layerwise_enabled=True, layer_pairs=["model.layers.0"], layer_loss_type="cosine")
+
+        with self.assertRaises(ValueError):
+            SelfDistillationConfig(
+                layerwise_enabled=True,
+                layer_pairs=["model.layers.0"],
+                layerwise_token_weighting="bad_mode",
+            )
+
+        with self.assertRaises(ValueError):
+            SelfDistillationConfig(
+                layerwise_enabled=True,
+                layer_pairs=["model.layers.0"],
+                aligned_layers={"layer_list": "model.layers"},
+            )
+
+        with self.assertRaises(ValueError):
+            SelfDistillationConfig(layerwise_enabled=True, aligned_layers={})
+
+        with self.assertRaises(ValueError):
+            SelfDistillationConfig(layerwise_enabled=True, aligned_layers={"layer_list": ""})
+
+    def test_resolve_layer_pairs_from_aligned_layers(self):
+        class DummyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList(
+                    [
+                        nn.Sequential(nn.Linear(2, 2), nn.ReLU()),
+                        nn.Sequential(nn.Linear(2, 2), nn.ReLU()),
+                    ]
+                )
+
+        student_model = DummyModel()
+        teacher_model = DummyModel()
+
+        layer_pairs = resolve_layer_pairs(
+            student_model,
+            teacher_model,
+            aligned_layers={"layer_list": "model.layers"},
+        )
+        self.assertEqual(layer_pairs, [("model.layers.0", "model.layers.0"), ("model.layers.1", "model.layers.1")])
+
+        submodule_pairs = resolve_layer_pairs(
+            student_model,
+            teacher_model,
+            aligned_layers={"layer_list": "model.layers", "output_module": "0"},
+        )
+        self.assertEqual(
+            submodule_pairs,
+            [("model.layers.0.0", "model.layers.0.0"), ("model.layers.1.0", "model.layers.1.0")],
+        )
 
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""

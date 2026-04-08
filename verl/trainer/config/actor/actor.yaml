@@ -127,6 +127,25 @@ self_distillation:
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
+  # Whether to enable layerwise hidden-state distillation on top of logits KD
+  layerwise_enabled: False
+
+  # Matched layer names; each entry can be a single layer name or "student=teacher"
+  layer_pairs: []
+
+  # Automatically align all layers under a shared layer list, e.g.
+  # {layer_list: model.layers, output_module: self_attn}
+  aligned_layers: {}
+
+  # Hidden-state loss type for layerwise distillation
+  layer_loss_type: mse
+
+  # Scalar multiplier for the layerwise term before adding it to logits KD
+  layerwise_weight: 1.0
+
+  # Optional token weighting for layerwise KD: none / jsd / sqrt_jsd
+  layerwise_token_weighting: none
+
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-
     {prompt}{solution}{feedback}

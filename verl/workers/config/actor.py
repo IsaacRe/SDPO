@@ -90,6 +90,12 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    layerwise_enabled: bool = False
+    layer_pairs: list[Any] = field(default_factory=list)
+    aligned_layers: dict[str, Any] = field(default_factory=dict)
+    layer_loss_type: str = "mse"
+    layerwise_weight: float = 1.0
+    layerwise_token_weighting: str = "none"
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -110,6 +116,45 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        valid_layer_loss_types = ["mse", "smooth_l1"]
+        if self.layer_loss_type not in valid_layer_loss_types:
+            raise ValueError(
+                "self_distillation.layer_loss_type must be one of "
+                f"{valid_layer_loss_types}, got {self.layer_loss_type}"
+            )
+        if self.layerwise_weight < 0:
+            raise ValueError(
+                f"self_distillation.layerwise_weight must be non-negative, got {self.layerwise_weight}"
+            )
+        valid_layerwise_token_weighting = ["none", "jsd", "sqrt_jsd"]
+        if self.layerwise_token_weighting not in valid_layerwise_token_weighting:
+            raise ValueError(
+                "self_distillation.layerwise_token_weighting must be one of "
+                f"{valid_layerwise_token_weighting}, got {self.layerwise_token_weighting}"
+            )
+        if self.layerwise_enabled:
+            has_layer_pairs = len(self.layer_pairs) > 0
+            has_aligned_layers = len(self.aligned_layers) > 0
+            if has_layer_pairs and has_aligned_layers:
+                raise ValueError(
+                    "self_distillation.layer_pairs and self_distillation.aligned_layers are mutually exclusive"
+                )
+            if not has_layer_pairs and not has_aligned_layers:
+                raise ValueError(
+                    "self_distillation.layer_pairs or self_distillation.aligned_layers must be provided "
+                    "when layerwise_enabled is True"
+                )
+            if has_aligned_layers:
+                layer_list = self.aligned_layers.get("layer_list")
+                if not isinstance(layer_list, str) or not layer_list.strip():
+                    raise ValueError(
+                        "self_distillation.aligned_layers.layer_list must be provided as a non-empty string"
+                    )
+                output_module = self.aligned_layers.get("output_module")
+                if output_module is not None and (not isinstance(output_module, str) or not output_module.strip()):
+                    raise ValueError(
+                        "self_distillation.aligned_layers.output_module must be a non-empty string when provided"
+                    )
 
 
 @dataclass

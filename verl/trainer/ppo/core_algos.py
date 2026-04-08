@@ -1188,6 +1188,142 @@ def compute_self_distillation_loss(
     return loss, metrics
 
 
+@torch.no_grad()
+def compute_layerwise_token_weights(
+    student_all_log_probs: torch.Tensor,
+    teacher_all_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    weight_mode: str,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if weight_mode == "none":
+        return torch.ones_like(response_mask), {}
+
+    if weight_mode not in {"jsd", "sqrt_jsd"}:
+        raise ValueError(f"Unsupported layerwise token weighting mode: {weight_mode}")
+
+    if student_all_log_probs is None or teacher_all_log_probs is None:
+        raise ValueError("Layerwise token weighting requires full student and teacher log-probabilities.")
+
+    student_all_log_probs = student_all_log_probs.detach()
+    teacher_all_log_probs = teacher_all_log_probs.detach()
+
+    mixture_log_probs = torch.logsumexp(
+        torch.stack(
+            [
+                student_all_log_probs + np.log(0.5),
+                teacher_all_log_probs + np.log(0.5),
+            ]
+        ),
+        dim=0,
+    )
+    kl_student = F.kl_div(mixture_log_probs, student_all_log_probs, reduction="none", log_target=True).sum(dim=-1)
+    kl_teacher = F.kl_div(mixture_log_probs, teacher_all_log_probs, reduction="none", log_target=True).sum(dim=-1)
+    jsd = 0.5 * (kl_student + kl_teacher)
+    jsd = torch.clamp(jsd, min=0.0)
+
+    if weight_mode == "sqrt_jsd":
+        raw_weights = torch.sqrt(jsd + eps)
+    else:
+        raw_weights = jsd
+
+    active_mask = response_mask
+    if self_distillation_mask is not None:
+        active_mask = active_mask * self_distillation_mask.unsqueeze(1)
+
+    masked_weight_sum = (raw_weights * active_mask).sum()
+    num_active_tokens = active_mask.sum()
+    if masked_weight_sum.item() <= eps or num_active_tokens.item() == 0:
+        normalized_weights = torch.ones_like(response_mask)
+    else:
+        normalized_weights = raw_weights * (num_active_tokens / masked_weight_sum)
+
+    metrics = {
+        "self_distillation/layerwise_token_weight_mean": (
+            (normalized_weights * active_mask).sum() / num_active_tokens.clamp(min=1.0)
+        ).detach().item(),
+        "self_distillation/layerwise_token_weight_raw_mean": (
+            (raw_weights * active_mask).sum() / num_active_tokens.clamp(min=1.0)
+        ).detach().item(),
+        "self_distillation/layerwise_token_jsd_mean": ((jsd * active_mask).sum() / num_active_tokens.clamp(min=1.0))
+        .detach()
+        .item(),
+    }
+    return normalized_weights, metrics
+
+
+def compute_layerwise_self_distillation_loss(
+    student_hidden_states: dict[str, torch.Tensor],
+    teacher_hidden_states: dict[str, torch.Tensor],
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    token_weights: Optional[torch.Tensor] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if len(student_hidden_states) == 0:
+        raise ValueError("No student hidden states were provided for layerwise self-distillation.")
+
+    metrics = {"self_distillation/num_layer_pairs": len(student_hidden_states)}
+    response_length = response_mask.shape[-1]
+
+    loss_mask = response_mask
+    if self_distillation_mask is not None:
+        loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+
+    total_loss = None
+    for student_layer_name, student_hidden in student_hidden_states.items():
+        if student_layer_name not in teacher_hidden_states:
+            raise ValueError(f"Missing teacher hidden states for student layer '{student_layer_name}'")
+
+        teacher_hidden = teacher_hidden_states[student_layer_name]
+        if student_hidden.shape != teacher_hidden.shape:
+            raise ValueError(
+                f"Mismatched student/teacher hidden-state shapes for layer '{student_layer_name}': "
+                f"{student_hidden.shape} vs {teacher_hidden.shape}"
+            )
+        if student_hidden.dim() != 3:
+            raise ValueError(
+                f"Layerwise distillation expects 3D hidden states [batch, seq, hidden], got {student_hidden.shape}"
+            )
+        if student_hidden.size(1) < response_length + 1:
+            raise ValueError(
+                f"Hidden state sequence for layer '{student_layer_name}' is too short for response slicing: "
+                f"{student_hidden.size(1)} < {response_length + 1}"
+            )
+
+        student_response_hidden = student_hidden[:, -response_length - 1 : -1, :]
+        teacher_response_hidden = teacher_hidden[:, -response_length - 1 : -1, :].detach()
+
+        if self_distillation_config.layer_loss_type == "mse":
+            per_token_loss = F.mse_loss(student_response_hidden, teacher_response_hidden, reduction="none").mean(dim=-1)
+        elif self_distillation_config.layer_loss_type == "smooth_l1":
+            per_token_loss = F.smooth_l1_loss(
+                student_response_hidden, teacher_response_hidden, reduction="none"
+            ).mean(dim=-1)
+        else:
+            raise ValueError(f"Unsupported layerwise loss type: {self_distillation_config.layer_loss_type}")
+
+        if token_weights is not None:
+            per_token_loss = per_token_loss * token_weights
+        if rollout_is_weights is not None:
+            per_token_loss = per_token_loss * rollout_is_weights
+
+        layer_loss = agg_loss(
+            loss_mat=per_token_loss,
+            loss_mask=loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+        )
+        metrics[f"self_distillation/layerwise_loss/{student_layer_name}"] = layer_loss.detach().item()
+        total_loss = layer_loss if total_loss is None else total_loss + layer_loss
+
+    assert total_loss is not None
+    return total_loss, metrics
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,

@@ -21,6 +21,8 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    compute_layerwise_self_distillation_loss,
+    compute_layerwise_token_weights,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -29,6 +31,7 @@ from verl.trainer.ppo.core_algos import (
     get_adv_estimator_fn,
     register_adv_est,
 )
+from verl.workers.config import SelfDistillationConfig
 
 
 def mock_test_fn():
@@ -257,6 +260,64 @@ def test_rloo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_compute_layerwise_token_weights_sqrt_jsd():
+    student_probs = torch.tensor(
+        [[[0.5, 0.5], [0.99, 0.01]]],
+        dtype=torch.float32,
+    )
+    teacher_probs = torch.tensor(
+        [[[0.5, 0.5], [0.01, 0.99]]],
+        dtype=torch.float32,
+    )
+    response_mask = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
+    student_log_probs = torch.log(student_probs)
+    teacher_log_probs = torch.log(teacher_probs)
+
+    token_weights, metrics = compute_layerwise_token_weights(
+        student_all_log_probs=student_log_probs,
+        teacher_all_log_probs=teacher_log_probs,
+        response_mask=response_mask,
+        weight_mode="sqrt_jsd",
+    )
+
+    assert token_weights.shape == response_mask.shape
+    assert token_weights[0, 1] > token_weights[0, 0]
+    assert torch.allclose(token_weights.mean(), torch.tensor(1.0), atol=1e-5)
+    assert metrics["self_distillation/layerwise_token_jsd_mean"] >= 0.0
+
+
+def test_compute_layerwise_self_distillation_loss_with_mask():
+    config = SelfDistillationConfig(layerwise_enabled=True, layer_pairs=["layer0"], layerwise_weight=1.0)
+    response_mask = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
+    self_distillation_mask = torch.tensor([1.0], dtype=torch.float32)
+    student_hidden = {
+        "layer0": torch.tensor(
+            [[[0.0, 0.0], [1.0, 1.0], [3.0, 3.0]]],
+            dtype=torch.float32,
+        )
+    }
+    teacher_hidden = {
+        "layer0": torch.tensor(
+            [[[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+    }
+    token_weights = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+
+    loss, metrics = compute_layerwise_self_distillation_loss(
+        student_hidden_states=student_hidden,
+        teacher_hidden_states=teacher_hidden,
+        response_mask=response_mask,
+        self_distillation_config=config,
+        self_distillation_mask=self_distillation_mask,
+        token_weights=token_weights,
+    )
+
+    expected = torch.tensor(1.0)
+    assert torch.allclose(loss, expected)
+    assert metrics["self_distillation/num_layer_pairs"] == 1
 
 
 @pytest.mark.parametrize(
