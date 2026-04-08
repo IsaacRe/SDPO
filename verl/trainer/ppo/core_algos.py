@@ -1279,19 +1279,28 @@ def compute_layerwise_self_distillation_loss(
             raise ValueError(f"Missing teacher hidden states for student layer '{student_layer_name}'")
 
         teacher_hidden = teacher_hidden_states[student_layer_name]
-        if student_hidden.shape != teacher_hidden.shape:
-            raise ValueError(
-                f"Mismatched student/teacher hidden-state shapes for layer '{student_layer_name}': "
-                f"{student_hidden.shape} vs {teacher_hidden.shape}"
-            )
         if student_hidden.dim() != 3:
             raise ValueError(
                 f"Layerwise distillation expects 3D hidden states [batch, seq, hidden], got {student_hidden.shape}"
+            )
+        if teacher_hidden.dim() != 3:
+            raise ValueError(
+                f"Layerwise distillation expects 3D teacher hidden states [batch, seq, hidden], got {teacher_hidden.shape}"
+            )
+        if student_hidden.size(0) != teacher_hidden.size(0) or student_hidden.size(2) != teacher_hidden.size(2):
+            raise ValueError(
+                f"Mismatched student/teacher hidden-state batch/hidden dims for layer '{student_layer_name}': "
+                f"{student_hidden.shape} vs {teacher_hidden.shape}"
             )
         if student_hidden.size(1) < response_length + 1:
             raise ValueError(
                 f"Hidden state sequence for layer '{student_layer_name}' is too short for response slicing: "
                 f"{student_hidden.size(1)} < {response_length + 1}"
+            )
+        if teacher_hidden.size(1) < response_length + 1:
+            raise ValueError(
+                f"Teacher hidden state sequence for layer '{student_layer_name}' is too short for response slicing: "
+                f"{teacher_hidden.size(1)} < {response_length + 1}"
             )
 
         student_response_hidden = student_hidden[:, -response_length - 1 : -1, :]

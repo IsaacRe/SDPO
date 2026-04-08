@@ -56,6 +56,7 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 MICROBATCH_PROGRESS_ENABLED = os.getenv("VERL_MICROBATCH_PROGRESS", "0") == "1"
+KD_BREAKDOWN_PROGRESS_ENABLED = os.getenv("VERL_KD_BREAKDOWN_PROGRESS", "0") == "1"
 
 
 class TrustRegionTeacher(nn.Module):
@@ -795,6 +796,11 @@ class DataParallelPPOActor(BasePPOActor):
                         and self_distillation_cfg.get("layerwise_enabled", False)
                         and self_distillation_cfg.get("layerwise_weight", 0.0) > 0.0
                     )
+                    teacher_model = self.teacher_module or self.actor_module
+                    if teacher_regularization == "trust-region" and (
+                        self.teacher_module is None or self.teacher_module is self.actor_module
+                    ):
+                        raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
                     layer_pairs = (
                         resolve_layer_pairs(
                             self.actor_module,
@@ -814,11 +820,6 @@ class DataParallelPPOActor(BasePPOActor):
                         or layerwise_weight_mode != "none"
                     )
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
-                    teacher_model = self.teacher_module or self.actor_module
-                    if teacher_regularization == "trust-region" and (
-                        self.teacher_module is None or self.teacher_module is self.actor_module
-                    ):
-                        raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
                     with (
                         LayerwiseActivationCapture(self.actor_module, teacher_model, layer_pairs)
                         if layerwise_enabled
@@ -925,6 +926,14 @@ class DataParallelPPOActor(BasePPOActor):
                                 pg_metrics["self_distillation/layerwise_weight"] = self_distillation_cfg.layerwise_weight
                                 pg_metrics.update(layerwise_weight_metrics)
                                 pg_metrics.update(layerwise_metrics)
+                                if KD_BREAKDOWN_PROGRESS_ENABLED and torch.distributed.get_rank() == 0:
+                                    print(
+                                        "[kd] "
+                                        f"logits={logits_kd_loss.detach().item():.6f} "
+                                        f"layerwise={layerwise_loss.detach().item():.6f} "
+                                        f"weight={self_distillation_cfg.layerwise_weight:.6f} "
+                                        f"total={pg_loss.detach().item():.6f}"
+                                    )
 
                             pg_metrics["self_distillation/total_kd_loss"] = pg_loss.detach().item()
                             pg_metrics["self_distillation/empty_target_batch"] = (
