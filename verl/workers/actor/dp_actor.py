@@ -821,7 +821,14 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
                     with (
-                        LayerwiseActivationCapture(self.actor_module, teacher_model, layer_pairs)
+                        LayerwiseActivationCapture(
+                            self.actor_module,
+                            teacher_model,
+                            layer_pairs,
+                            detach_student_activations=self_distillation_cfg.get(
+                                "layerwise_detach_student_activations", False
+                            ),
+                        )
                         if layerwise_enabled
                         else nullcontext()
                     ) as layerwise_capture:

@@ -32,6 +32,16 @@ def _extract_activation_tensor(output: Any) -> torch.Tensor:
     raise TypeError(f"Unsupported hooked activation output type: {type(output)}")
 
 
+def _detach_activation_output(output: Any) -> Any:
+    if isinstance(output, torch.Tensor):
+        return output.detach()
+    if isinstance(output, tuple):
+        return tuple(_detach_activation_output(value) for value in output)
+    if isinstance(output, list):
+        return [_detach_activation_output(value) for value in output]
+    return output
+
+
 def _resolve_submodule(module: nn.Module, name: str) -> nn.Module:
     try:
         return module.get_submodule(name)
@@ -116,6 +126,7 @@ class LayerwiseActivationCapture:
     student_model: nn.Module
     teacher_model: nn.Module
     layer_pairs: list[tuple[str, str]]
+    detach_student_activations: bool = False
 
     def __post_init__(self):
         self._handles: list[Any] = []
@@ -153,6 +164,8 @@ class LayerwiseActivationCapture:
         def hook(_module, _inputs, output):
             if self._phase == "student":
                 self._student_cache[layer_name] = _extract_activation_tensor(output)
+                if self.detach_student_activations:
+                    return _detach_activation_output(output)
 
         return hook
 

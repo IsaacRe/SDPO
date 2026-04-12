@@ -149,6 +149,10 @@ self_distillation:
   # Optional token weighting for layerwise KD: none / jsd / sqrt_jsd
   layerwise_token_weighting: none
 
+  # If true, each hooked student activation is detached before being passed
+  # downstream, so a layer only receives gradient from its own layerwise loss.
+  layerwise_detach_student_activations: false
+
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-
     {prompt}{solution}{feedback}

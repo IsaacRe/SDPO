@@ -97,6 +97,7 @@ class SelfDistillationConfig(BaseConfig):
     logits_kd_weight: float = 1.0
     layerwise_weight: float = 1.0
     layerwise_token_weighting: str = "none"
+    layerwise_detach_student_activations: bool = False
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

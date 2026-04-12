@@ -225,10 +225,12 @@ class TestActorConfig(unittest.TestCase):
             layerwise_token_weighting="sqrt_jsd",
             layer_loss_type="smooth_l1",
             layerwise_weight=0.25,
+            layerwise_detach_student_activations=True,
         )
         self.assertTrue(config.layerwise_enabled)
         self.assertEqual(config.layer_pairs, ["model.layers.0"])
         self.assertEqual(config.layerwise_token_weighting, "sqrt_jsd")
+        self.assertTrue(config.layerwise_detach_student_activations)
 
         with self.assertRaises(ValueError):
             SelfDistillationConfig(layerwise_enabled=True, layer_pairs=[])
