@@ -894,8 +894,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 rollout_is_weights=rollout_is_weights,
                             )
 
-                            pg_loss = logits_kd_loss
+                            pg_loss = self_distillation_cfg.logits_kd_weight * logits_kd_loss
                             pg_metrics["self_distillation/logits_kd_loss"] = logits_kd_loss.detach().item()
+                            pg_metrics["self_distillation/logits_kd_weight"] = self_distillation_cfg.logits_kd_weight
 
                             if layerwise_enabled:
                                 layerwise_token_weights, layerwise_weight_metrics = compute_layerwise_token_weights(
@@ -930,8 +931,9 @@ class DataParallelPPOActor(BasePPOActor):
                                     print(
                                         "[kd] "
                                         f"logits={logits_kd_loss.detach().item():.6f} "
+                                        f"logits_weight={self_distillation_cfg.logits_kd_weight:.6f} "
                                         f"layerwise={layerwise_loss.detach().item():.6f} "
-                                        f"weight={self_distillation_cfg.layerwise_weight:.6f} "
+                                        f"layerwise_weight={self_distillation_cfg.layerwise_weight:.6f} "
                                         f"total={pg_loss.detach().item():.6f}"
                                     )
 

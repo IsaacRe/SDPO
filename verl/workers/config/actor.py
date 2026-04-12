@@ -94,6 +94,7 @@ class SelfDistillationConfig(BaseConfig):
     layer_pairs: list[Any] = field(default_factory=list)
     aligned_layers: dict[str, Any] = field(default_factory=dict)
     layer_loss_type: str = "mse"
+    logits_kd_weight: float = 1.0
     layerwise_weight: float = 1.0
     layerwise_token_weighting: str = "none"
 
@@ -121,6 +122,10 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 "self_distillation.layer_loss_type must be one of "
                 f"{valid_layer_loss_types}, got {self.layer_loss_type}"
+            )
+        if self.logits_kd_weight < 0:
+            raise ValueError(
+                f"self_distillation.logits_kd_weight must be non-negative, got {self.logits_kd_weight}"
             )
         if self.layerwise_weight < 0:
             raise ValueError(

@@ -140,6 +140,9 @@ self_distillation:
   # Hidden-state loss type for layerwise distillation
   layer_loss_type: mse
 
+  # Scalar multiplier for the logits KD term before adding any layerwise term
+  logits_kd_weight: 1.0
+
   # Scalar multiplier for the layerwise term before adding it to logits KD
   layerwise_weight: 1.0
 
